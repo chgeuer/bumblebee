@@ -460,7 +460,7 @@ defmodule Bumblebee.Text.Gemma4 do
     )
   end
 
-  defp decoder(hidden_state, position_ids, attention_mask, _cache, per_layer_inputs, spec, opts) do
+  defp decoder(hidden_state, position_ids, attention_mask, cache, per_layer_inputs, spec, opts) do
     name = opts[:name]
     layer_types = resolve_layer_types(spec)
 
@@ -471,7 +471,6 @@ defmodule Bumblebee.Text.Gemma4 do
     kv_share_map =
       for {_lt, idx} <- Enum.with_index(layer_types), idx >= first_kv_shared, into: %{} do
         this_type = Enum.at(layer_types, idx)
-        # Find last non-shared layer of the same type
         source_idx =
           non_shared_types
           |> Enum.with_index()
@@ -482,59 +481,70 @@ defmodule Bumblebee.Text.Gemma4 do
         {idx, source_idx}
       end
 
+    # Integrate KV cache for autoregressive generation
+    {attention_mask, cache} = Layers.Decoder.cached_attention_mask(attention_mask, cache)
+    offset = Layers.Decoder.get_cache_offset(cache)
+
     state = %{
       hidden_state: hidden_state,
       hidden_states: Layers.none(),
       attentions: Layers.none(),
-      cache: Layers.none(),
+      cache: cache,
       stored_kv: %{}
     }
 
-    Enum.reduce(Enum.with_index(layer_types), state, fn {layer_type, idx}, acc ->
-      block_name = join(name, "blocks.#{idx}")
+    outputs =
+      Enum.reduce(Enum.with_index(layer_types), state, fn {layer_type, idx}, acc ->
+        block_name = join(name, "blocks.#{idx}")
 
-      # Extract per-layer input for PLE
-      ple_input =
-        if spec.hidden_size_per_layer_input > 0 do
-          Axon.nx(per_layer_inputs, fn x ->
-            x[[.., .., idx, ..]]
-          end)
-        else
-          Layers.none()
-        end
+        ple_input =
+          if spec.hidden_size_per_layer_input > 0 do
+            Axon.nx(per_layer_inputs, fn x ->
+              x[[.., .., idx, ..]]
+            end)
+          else
+            Layers.none()
+          end
 
-      # KV sharing: determine if this layer uses shared KV
-      shared_kv_source = Map.get(kv_share_map, idx)
-      shared_kv = if shared_kv_source, do: Map.get(acc.stored_kv, shared_kv_source), else: nil
+        shared_kv_source = Map.get(kv_share_map, idx)
+        shared_kv = if shared_kv_source, do: Map.get(acc.stored_kv, shared_kv_source), else: nil
 
-      {new_hidden, kv_out} =
-        decoder_block(
-          acc.hidden_state,
-          position_ids,
-          attention_mask,
-          ple_input,
-          layer_type,
-          idx,
-          spec,
-          shared_kv: shared_kv,
-          name: block_name
-        )
+        block_cache = Layers.Decoder.get_block_cache(acc.cache, idx)
 
-      # Store KV from non-shared layers
-      new_stored_kv =
-        if idx < first_kv_shared and kv_out do
-          Map.put(acc.stored_kv, idx, kv_out)
-        else
-          acc.stored_kv
-        end
+        {new_hidden, kv_for_sharing, block_cache} =
+          decoder_block(
+            acc.hidden_state,
+            position_ids,
+            attention_mask,
+            ple_input,
+            layer_type,
+            idx,
+            spec,
+            shared_kv: shared_kv,
+            block_cache: block_cache,
+            offset: offset,
+            name: block_name
+          )
 
-      %{
-        acc
-        | hidden_state: new_hidden,
-          hidden_states: Layers.append(acc.hidden_states, new_hidden),
-          stored_kv: new_stored_kv
-      }
-    end)
+        new_cache = Layers.Decoder.put_block_cache(acc.cache, idx, block_cache)
+
+        new_stored_kv =
+          if idx < first_kv_shared and kv_for_sharing do
+            Map.put(acc.stored_kv, idx, kv_for_sharing)
+          else
+            acc.stored_kv
+          end
+
+        %{
+          acc
+          | hidden_state: new_hidden,
+            hidden_states: Layers.append(acc.hidden_states, new_hidden),
+            cache: new_cache,
+            stored_kv: new_stored_kv
+        }
+      end)
+
+    update_in(outputs.cache, &Layers.Decoder.update_cache_offset(&1, hidden_state))
   end
 
   defp decoder_block(
@@ -549,6 +559,8 @@ defmodule Bumblebee.Text.Gemma4 do
        ) do
     name = opts[:name]
     shared_kv = opts[:shared_kv]
+    block_cache = opts[:block_cache]
+    offset = opts[:offset]
 
     hd_dim = if layer_type == :full_attention, do: spec.global_attention_head_size || spec.attention_head_size, else: spec.attention_head_size
 
@@ -563,7 +575,7 @@ defmodule Bumblebee.Text.Gemma4 do
 
     normed = rms_norm_llama(hidden_state, spec, name: join(name, "input_layernorm"))
 
-    {attn_out, kv_out} =
+    {attn_out, kv_for_sharing, block_cache} =
       self_attention(
         normed,
         position_ids,
@@ -575,6 +587,8 @@ defmodule Bumblebee.Text.Gemma4 do
         kv_heads: kv_heads,
         share_kv: share_kv_proj,
         shared_kv: shared_kv,
+        block_cache: block_cache,
+        offset: offset,
         name: join(name, "self_attn")
       )
 
@@ -621,7 +635,7 @@ defmodule Bumblebee.Text.Gemma4 do
         name: join(name, "layer_scalar")
       )
 
-    {hidden_state, kv_out}
+    {hidden_state, kv_for_sharing, block_cache}
   end
 
   defp self_attention(
@@ -638,6 +652,8 @@ defmodule Bumblebee.Text.Gemma4 do
     kv_heads = opts[:kv_heads]
     share_kv = opts[:share_kv]
     shared_kv = opts[:shared_kv]
+    block_cache = opts[:block_cache]
+    offset = opts[:offset]
 
     q_size = spec.num_attention_heads * hd_dim
     kv_size = kv_heads * hd_dim
@@ -652,10 +668,24 @@ defmodule Bumblebee.Text.Gemma4 do
 
     query = rms_norm_per_head(query, hd_dim, spec, name: join(name, "q_norm"))
 
-    # K/V projections (compute fresh or reuse from shared layer)
-    {key, value, kv_out} =
+    # RoPE on Q
+    {rope_base, partial_factor} =
+      case layer_type do
+        :full_attention -> {spec.rotary_embedding_base, spec.partial_rotary_factor}
+        _ -> {spec.rotary_embedding_base_local, 1.0}
+      end
+
+    {query_roped, _} =
+      apply_rope(query, query, position_ids, hd_dim, rope_base, partial_factor, name: join(name, "rope_q"))
+
+    # Transpose Q: {batch, seq, heads, dim} → {batch, heads, seq, dim}
+    query = Axon.nx(query_roped, &Nx.transpose(&1, axes: [0, 2, 1, 3]))
+
+    # K/V: compute fresh (non-shared) or reuse from shared layer
+    {key, value, kv_for_sharing, block_cache} =
       if shared_kv do
-        {shared_kv.key, shared_kv.value, nil}
+        # Shared layer: reuse K/V from source layer's cache (already full sequence)
+        {shared_kv.key, shared_kv.value, nil, block_cache}
       else
         key = Axon.dense(hidden_state, kv_size, use_bias: false, name: join(name, "k_proj"))
         value =
@@ -681,35 +711,33 @@ defmodule Bumblebee.Text.Gemma4 do
             name: join(name, "v_norm")
           )
 
-        # RoPE on K
-        {rope_base, partial_factor} =
-          case layer_type do
-            :full_attention -> {spec.rotary_embedding_base, spec.partial_rotary_factor}
-            _ -> {spec.rotary_embedding_base_local, 1.0}
-          end
-
+        # RoPE on K (in {batch, seq, heads, dim} format)
         {_, key_roped} =
           apply_rope(key, key, position_ids, hd_dim, rope_base, partial_factor, name: join(name, "rope_k"))
 
-        key_t = Axon.nx(key_roped, &Nx.transpose(&1, axes: [0, 2, 1, 3]))
-        value_t = Axon.nx(value, &Nx.transpose(&1, axes: [0, 2, 1, 3]))
+        # Cache K/V before transpose/GQA (format: {batch, seq, kv_heads, hd_dim})
+        {self_attention_cache, cross_attention_cache} =
+          Layers.Decoder.get_attention_caches(block_cache)
 
-        {key_t, value_t, %{key: key_t, value: value_t}}
+        {key_cached, value_cached, self_attention_cache} =
+          Layers.Decoder.cached_attention_key_values(
+            key_roped, value, self_attention_cache, offset
+          )
+
+        block_cache =
+          Layers.Decoder.put_attention_caches(
+            block_cache, self_attention_cache, cross_attention_cache
+          )
+
+        # Store post-cache, pre-transpose K/V for KV sharing
+        {key_cached, value_cached, %{key: key_cached, value: value_cached}, block_cache}
       end
 
-    # RoPE on Q
-    {rope_base, partial_factor} =
-      case layer_type do
-        :full_attention -> {spec.rotary_embedding_base, spec.partial_rotary_factor}
-        _ -> {spec.rotary_embedding_base_local, 1.0}
-      end
+    # Transpose K/V: {batch, seq, heads, dim} → {batch, heads, seq, dim}
+    key = Axon.nx(key, &Nx.transpose(&1, axes: [0, 2, 1, 3]))
+    value = Axon.nx(value, &Nx.transpose(&1, axes: [0, 2, 1, 3]))
 
-    {query_roped, _} =
-      apply_rope(query, query, position_ids, hd_dim, rope_base, partial_factor, name: join(name, "rope_q"))
-
-    query = Axon.nx(query_roped, &Nx.transpose(&1, axes: [0, 2, 1, 3]))
-
-    # GQA: repeat KV heads to match query heads (repeat_interleave semantics)
+    # GQA: repeat KV heads to match query heads
     num_groups = div(spec.num_attention_heads, kv_heads)
 
     key =
@@ -740,26 +768,34 @@ defmodule Bumblebee.Text.Gemma4 do
         value
       end
 
-    # Scaled dot-product attention
+    # Scaled dot-product attention with offset-aware causal masking
     attn_output =
       Axon.layer(
-        fn q, k, v, mask, _opts ->
-          # Attention scaling is 1.0 since Q/K are already RMS-normalized
+        fn q, k, v, mask, off, _opts ->
           scores = q |> Nx.dot([3], [0, 1], k, [3], [0, 1])
 
-          # Causal mask
           {_b, _h, q_len, kv_len} = Nx.shape(scores)
 
+          # Use cache offset for causal mask position; fall back to
+          # kv_len - q_len when running without cache
+          offset_val =
+            case off do
+              %Axon.None{} -> kv_len - q_len
+              off_tensor -> off_tensor
+            end
+
           causal =
-            Nx.iota({q_len, kv_len}, axis: 1)
-            |> Nx.less_equal(Nx.iota({q_len, kv_len}, axis: 0) |> Nx.add(kv_len - q_len))
+            Nx.less_equal(
+              Nx.iota({q_len, kv_len}, axis: 1),
+              Nx.add(Nx.iota({q_len, kv_len}, axis: 0), offset_val)
+            )
 
           # Sliding window mask
           causal =
             case layer_type do
               :sliding_attention ->
                 window = spec.attention_window_size
-                row_idx = Nx.iota({q_len, kv_len}, axis: 0) |> Nx.add(kv_len - q_len)
+                row_idx = Nx.add(Nx.iota({q_len, kv_len}, axis: 0), offset_val)
                 col_idx = Nx.iota({q_len, kv_len}, axis: 1)
                 dist = Nx.subtract(row_idx, col_idx)
                 Nx.logical_and(causal, Nx.less_equal(dist, window))
@@ -768,7 +804,6 @@ defmodule Bumblebee.Text.Gemma4 do
                 causal
             end
 
-          # Broadcast to match scores shape
           causal = Nx.reshape(causal, {1, 1, q_len, kv_len})
           causal = Nx.broadcast(causal, Nx.shape(scores))
           mask_value = Nx.Constants.neg_infinity(Nx.type(scores))
@@ -789,7 +824,7 @@ defmodule Bumblebee.Text.Gemma4 do
 
           Nx.dot(weights, [3], [0, 1], v, [2], [0, 1])
         end,
-        [query, key, value, attention_mask],
+        [query, key, value, attention_mask, Axon.optional(offset)],
         name: join(name, "attention")
       )
 
@@ -802,7 +837,7 @@ defmodule Bumblebee.Text.Gemma4 do
 
     # Output projection
     out = Axon.dense(attn_output, spec.hidden_size, use_bias: false, name: join(name, "o_proj"))
-    {out, kv_out}
+    {out, kv_for_sharing, block_cache}
   end
 
 
